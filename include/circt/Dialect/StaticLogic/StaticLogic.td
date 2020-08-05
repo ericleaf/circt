@@ -26,7 +26,7 @@ def StaticLogic_Dialect : Dialect {
   let cppNamespace = "";
 }
 
-def PipelineOp : Op<StaticLogic_Dialect, "pipeline", [NoSideEffect]> {
+def PipelineOp : Op<StaticLogic_Dialect, "pipeline", [IsolatedFromAbove]> {
   let summary = "pipeline operation";
   let description = [{
     The "staticlogic.pipeline" operation represents a statically scheduled 
