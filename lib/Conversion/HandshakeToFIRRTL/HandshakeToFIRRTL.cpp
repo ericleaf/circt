@@ -10,6 +10,7 @@
 #include "circt/Conversion/HandshakeToFIRRTL/HandshakeToFIRRTL.h"
 #include "circt/Dialect/FIRRTL/Ops.h"
 #include "circt/Dialect/Handshake/HandshakeOps.h"
+#include "circt/Dialect/StaticLogic/StaticLogic.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/Utils.h"
 
@@ -239,9 +240,10 @@ static FModuleOp checkSubModuleOp(FModuleOp topModuleOp, Operation *oldOp) {
 
 /// All standard expressions and handshake elastic components will be converted
 /// to a FIRRTL sub-module and be instantiated in the top-module.
-static FModuleOp createSubModuleOp(FModuleOp topModuleOp, Operation *oldOp,
-                                   bool hasClock,
-                                   ConversionPatternRewriter &rewriter) {
+static FModuleOp
+createSubModuleOp(FModuleOp topModuleOp, Operation *oldOp, bool hasClock,
+                  ConversionPatternRewriter &rewriter,
+                  function_ref<std::string(Operation *)> getName) {
   rewriter.setInsertionPoint(topModuleOp);
   using ModulePort = std::pair<StringAttr, FIRRTLType>;
   llvm::SmallVector<ModulePort, 8> ports;
@@ -282,12 +284,11 @@ static FModuleOp createSubModuleOp(FModuleOp topModuleOp, Operation *oldOp,
   }
 
   return rewriter.create<FModuleOp>(
-      topModuleOp.getLoc(), rewriter.getStringAttr(getSubModuleName(oldOp)),
-      ports);
+      topModuleOp.getLoc(), rewriter.getStringAttr(getName(oldOp)), ports);
 }
 
 //===----------------------------------------------------------------------===//
-// Combinational Logic Builders
+// Sub-module Logic Builders
 //===----------------------------------------------------------------------===//
 
 /// Extract all subfields of all ports of the sub-module.
@@ -801,6 +802,26 @@ static void convertReturnOp(Operation *oldOp, FModuleOp topModuleOp,
   rewriter.eraseOp(oldOp);
 }
 
+static void convertPipelineOp(Operation *oldOp, FModuleOp topModuleOp,
+                              unsigned pipelineIdx,
+                              ConversionPatternRewriter &rewriter) {
+  auto subModuleOp =
+      createSubModuleOp(topModuleOp, oldOp, /*hasClock=*/true, rewriter,
+                        [pipelineIdx](Operation *op) -> std::string {
+                          return op->getName().getStringRef().str() + "_" +
+                                 std::to_string(pipelineIdx);
+                        });
+
+  Operation *termOp = subModuleOp.getBody().front().getTerminator();
+  Location insertLoc = termOp->getLoc();
+  rewriter.setInsertionPoint(termOp);
+  ValueVectorList portList = extractSubfields(subModuleOp, insertLoc, rewriter);
+
+  // TODO: build pipeline logic here.
+
+  createInstOp(oldOp, subModuleOp, topModuleOp, /*clockDomain=*/0, rewriter);
+}
+
 //===----------------------------------------------------------------------===//
 // HandshakeToFIRRTL lowering Pass
 //===----------------------------------------------------------------------===//
@@ -841,21 +862,30 @@ struct HandshakeFuncOpLowering : public OpConversionPattern<handshake::FuncOp> {
         funcOp.getLoc(), rewriter.getStringAttr(funcOp.getName()));
     rewriter.setInsertionPointToStart(circuitOp.getBody());
     auto topModuleOp = createTopModuleOp(funcOp, /*numClocks=*/1, rewriter);
+    unsigned pipelineIdx = 0;
 
     // Traverse and convert each operation in funcOp.
     for (Operation &op : topModuleOp.getBody().front()) {
       if (isa<handshake::ReturnOp>(op))
         convertReturnOp(&op, topModuleOp, funcOp, rewriter);
 
-      // This branch takes care of all non-timing operations that require to
-      // be instantiated in the top-module.
-      else if (op.getDialect()->getNamespace() != "firrtl") {
+      // Convert static scheduled pipeline operations to a FIRRTL sub-module.
+      else if (isa<staticlogic::PipelineOp>(op)) {
+        convertPipelineOp(&op, topModuleOp, pipelineIdx, rewriter);
+        pipelineIdx += 1;
+      }
+
+      // This branch takes care of all other standard and hanshake operations
+      // that require to be instantiated in the top-module.
+      else if (op.getDialect()->getNamespace() == "std" ||
+               op.getDialect()->getNamespace() == "handshake") {
         FModuleOp subModuleOp = checkSubModuleOp(topModuleOp, &op);
         bool hasClock = isa<handshake::BufferOp>(op);
 
         // Check if the sub-module already exists.
         if (!subModuleOp) {
-          subModuleOp = createSubModuleOp(topModuleOp, &op, hasClock, rewriter);
+          subModuleOp = createSubModuleOp(topModuleOp, &op, hasClock, rewriter,
+                                          getSubModuleName);
 
           Operation *termOp = subModuleOp.getBody().front().getTerminator();
           Location insertLoc = termOp->getLoc();
@@ -864,6 +894,7 @@ struct HandshakeFuncOpLowering : public OpConversionPattern<handshake::FuncOp> {
           ValueVectorList portList =
               extractSubfields(subModuleOp, insertLoc, rewriter);
 
+          // Build standard expressions logic.
           if (isa<mlir::AddIOp>(op))
             buildBinaryLogic<AddPrimOp>(portList, insertLoc, rewriter);
 
@@ -910,7 +941,7 @@ struct HandshakeFuncOpLowering : public OpConversionPattern<handshake::FuncOp> {
           else if (isa<mlir::SignedShiftRightOp>(op))
             buildBinaryLogic<DShrPrimOp>(portList, insertLoc, rewriter);
 
-          // Build elastic components logic
+          // Build handshake elastic components logic.
           else if (isa<handshake::SinkOp>(op))
             buildSinkLogic(portList, insertLoc, rewriter);
 
