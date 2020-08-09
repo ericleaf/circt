@@ -802,6 +802,69 @@ static void convertReturnOp(Operation *oldOp, FModuleOp topModuleOp,
   rewriter.eraseOp(oldOp);
 }
 
+static void insertDataRegisters(Block *block, Value clockVal,
+                                Location insertLoc,
+                                ConversionPatternRewriter &rewriter) {
+  ValueVector stageRegs;
+
+  // Walk through all block arguments. If an argument is used by other
+  // blocks, it needs to be registered.
+  for (auto blockArg : block->getArguments()) {
+    bool needReg = false;
+    for (auto &use : blockArg.getUses())
+      if (use.getOwner()->getBlock() != block) {
+        needReg = true;
+        break;
+      }
+
+    // Only push back unique operands.
+    if (needReg && std::find(stageRegs.begin(), stageRegs.end(), blockArg) ==
+                       stageRegs.end())
+      stageRegs.push_back(blockArg);
+  }
+
+  // Walk through all results of all operations in the block. If a result is
+  // used by other blocks, it needs to be regitered.
+  for (auto &op : *block) {
+    for (auto result : op.getResults()) {
+      bool needReg = false;
+      for (auto &use : result.getUses())
+        if (use.getOwner()->getBlock() != block) {
+          needReg = true;
+          break;
+        }
+
+      // Only push back unique operands.
+      if (needReg && std::find(stageRegs.begin(), stageRegs.end(), result) ==
+                         stageRegs.end())
+        stageRegs.push_back(result);
+    }
+  }
+
+  // Insert stage registers.
+  for (auto value : stageRegs) {
+    auto regOp = rewriter.create<firrtl::RegOp>(
+        insertLoc, value.getType(), clockVal, rewriter.getStringAttr(""));
+    value.replaceUsesWithIf(regOp, [block](OpOperand &use) -> bool {
+      return use.getOwner()->getBlock() != block;
+    });
+    rewriter.create<firrtl::ConnectOp>(insertLoc, regOp, value);
+  }
+}
+
+/// Convert all standard operations in a pipeline stage to FIRRTL.
+static void convertPipelineStage(Block *block, Location insertLoc,
+                                 ConversionPatternRewriter &rewriter) {
+  for (auto &op : *block) {
+    if (auto addOp = dyn_cast<mlir::AddIOp>(op)) {
+      auto firrtlAddOp = rewriter.create<firrtl::AddPrimOp>(
+          insertLoc, op.getOperand(0).getType(), op.getOperand(0),
+          op.getOperand(1));
+      addOp.getResult().replaceAllUsesWith(firrtlAddOp.getResult());
+    }
+  }
+}
+
 static void convertPipelineOp(Operation *oldOp, FModuleOp topModuleOp,
                               unsigned pipelineIdx,
                               ConversionPatternRewriter &rewriter) {
@@ -817,7 +880,35 @@ static void convertPipelineOp(Operation *oldOp, FModuleOp topModuleOp,
   rewriter.setInsertionPoint(termOp);
   ValueVectorList portList = extractSubfields(subModuleOp, insertLoc, rewriter);
 
-  // TODO: build pipeline logic here.
+  // Build pipeline logic.
+  auto &pipelineRegion = cast<staticlogic::PipelineOp>(oldOp).getRegion();
+  unsigned numIns = oldOp->getNumOperands();
+  unsigned numOuts = oldOp->getNumResults();
+  Value clockVal = portList[numIns + numOuts][0];
+  Value resetVal = portList[numIns + numOuts + 1][0];
+
+  // Lower standard operations to FIRRTL, and insert pipeline registers.
+  for (auto &block : pipelineRegion) {
+    insertDataRegisters(&block, clockVal, insertLoc, rewriter);
+    convertPipelineStage(&block, insertLoc, rewriter);
+    rewriter.setInsertionPoint(termOp);
+  }
+
+  // Replace all uses of arguments of the entry block with the data
+  // sub-fields of arguments of the FIRRTL pipeline module.
+  unsigned argsIdx = 0;
+  for (auto &arg : pipelineRegion.front().getArguments()) {
+    arg.replaceAllUsesWith(portList[argsIdx][2]);
+    argsIdx += 1;
+  }
+
+  // Convert return operation.
+  unsigned outsIdx = 0;
+  for (auto result : pipelineRegion.back().getTerminator()->getOperands()) {
+    rewriter.create<ConnectOp>(insertLoc, portList[numIns + outsIdx][2],
+                               result);
+    outsIdx += 1;
+  }
 
   createInstOp(oldOp, subModuleOp, topModuleOp, /*clockDomain=*/0, rewriter);
 }
