@@ -802,43 +802,33 @@ static void convertReturnOp(Operation *oldOp, FModuleOp topModuleOp,
   rewriter.eraseOp(oldOp);
 }
 
+/// TODO: Insert valid registers and implement flushable pipeline logic.
 static void insertDataRegisters(Block *block, Value clockVal,
                                 Location insertLoc,
                                 ConversionPatternRewriter &rewriter) {
   ValueVector stageRegs;
+
   // Walk through all block arguments. If an argument is used by other
   // blocks, it needs to be registered.
-  for (auto blockArg : block->getArguments()) {
-    bool needReg = false;
-    for (auto &use : blockArg.getUses())
+  for (auto arg : block->getArguments())
+    for (auto &use : arg.getUses())
       if (use.getOwner()->getBlock() != block) {
-        needReg = true;
+        stageRegs.push_back(arg);
         break;
       }
 
-    // Only push back unique operands.
-    if (needReg && std::find(stageRegs.begin(), stageRegs.end(), blockArg) ==
-                       stageRegs.end())
-      stageRegs.push_back(blockArg);
-  }
-
   // Walk through all results of all operations in the block. If a result is
   // used by other blocks, it needs to be regitered.
-  for (auto &op : *block) {
-    for (auto result : op.getResults()) {
-      bool needReg = false;
+  for (auto &op : *block)
+    for (auto result : op.getResults())
       for (auto &use : result.getUses())
         if (use.getOwner()->getBlock() != block) {
-          needReg = true;
+          // Only push back unique operands.
+          if (std::find(stageRegs.begin(), stageRegs.end(), result) ==
+              stageRegs.end())
+            stageRegs.push_back(result);
           break;
         }
-
-      // Only push back unique operands.
-      if (needReg && std::find(stageRegs.begin(), stageRegs.end(), result) ==
-                         stageRegs.end())
-        stageRegs.push_back(result);
-    }
-  }
 
   // Insert stage registers.
   for (auto value : stageRegs) {
