@@ -802,61 +802,128 @@ static void convertReturnOp(Operation *oldOp, FModuleOp topModuleOp,
   rewriter.eraseOp(oldOp);
 }
 
-/// TODO: Insert valid registers and implement flushable pipeline logic.
-static void insertDataRegisters(Block *block, Value clockVal,
-                                Location insertLoc,
-                                ConversionPatternRewriter &rewriter) {
-  ValueVector stageRegs;
-
-  // Walk through all block arguments. If an argument is used by other
-  // blocks, it needs to be registered.
-  for (auto arg : block->getArguments())
-    for (auto &use : arg.getUses())
-      if (use.getOwner()->getBlock() != block) {
-        stageRegs.push_back(arg);
-        break;
-      }
-
-  // Walk through all results of all operations in the block. If a result is
-  // used by other blocks, it needs to be regitered.
-  for (auto &op : *block)
-    for (auto result : op.getResults())
-      for (auto &use : result.getUses())
-        if (use.getOwner()->getBlock() != block) {
-          // Only push back unique operands.
-          if (std::find(stageRegs.begin(), stageRegs.end(), result) ==
-              stageRegs.end())
-            stageRegs.push_back(result);
-          break;
-        }
-
-  // Insert stage registers.
-  for (auto value : stageRegs) {
-    auto regOp = rewriter.create<firrtl::RegOp>(
-        insertLoc, value.getType(), clockVal, rewriter.getStringAttr(""));
-    value.replaceUsesWithIf(regOp, [block](OpOperand &use) -> bool {
-      return use.getOwner()->getBlock() != block;
-    });
-    rewriter.create<firrtl::ConnectOp>(insertLoc, regOp, value);
+/// TODO: Temporary. Need to be rewritten.
+static FIRRTLType getFirrtlType(Type type) {
+  if (auto firrtlType = type.dyn_cast<FIRRTLType>()) {
+    return firrtlType;
+  } else {
+    return getBundleType(type, /*isFlip=*/false)
+        .cast<firrtl::BundleType>()
+        .getElement("data")
+        .getValue()
+        .second;
   }
 }
 
 /// Convert all standard operations in a pipeline stage to FIRRTL.
 /// TODO: Add more operations support.
-static void convertPipelineStage(Block *block, Location insertLoc,
-                                 ConversionPatternRewriter &rewriter) {
-  for (auto &op : *block) {
-    if (auto addOp = dyn_cast<mlir::AddIOp>(op)) {
-      auto firrtlAddOp = rewriter.create<firrtl::AddPrimOp>(
-          insertLoc, op.getOperand(0).getType(), op.getOperand(0),
-          op.getOperand(1));
-      addOp.getResult().replaceAllUsesWith(firrtlAddOp.getResult());
-      rewriter.eraseOp(addOp);
+static void convertPipelineStages(FModuleOp subModuleOp, Location insertLoc,
+                                  ConversionPatternRewriter &rewriter) {
+  for (auto &block : llvm::drop_begin(subModuleOp, 1)) {
+    rewriter.setInsertionPoint(block.getTerminator());
+    for (auto &op : block) {
+      if (auto addOp = dyn_cast<mlir::AddIOp>(op)) {
+
+        auto firrtlAddOp = rewriter.create<firrtl::AddPrimOp>(
+            insertLoc, getFirrtlType(addOp.getResult().getType()),
+            addOp.getOperand(0), addOp.getOperand(1));
+        addOp.getResult().replaceAllUsesWith(firrtlAddOp.getResult());
+        rewriter.eraseOp(addOp);
+      }
     }
   }
 }
 
-static void convertPipelineOp(Operation *oldOp, firrtl::FModuleOp topModuleOp,
+/// TODO: Add valid registers and implement flushable pipeline logic.
+static void buildPipelineStructure(FModuleOp subModuleOp,
+                                   ValueVectorList portList, unsigned numIns,
+                                   unsigned numOuts, Location insertLoc,
+                                   ConversionPatternRewriter &rewriter) {
+  Value clockVal = portList[numIns + numOuts][0];
+  Value resetVal = portList[numIns + numOuts + 1][0];
+
+  // Prepare a constant zero operation for initializing valid registers.
+  rewriter.setInsertionPoint(subModuleOp.front().getTerminator());
+  auto signalType = UIntType::get(subModuleOp.getContext(), 1);
+  auto valueType = rewriter.getIntegerType(1, /*isSigned=*/false);
+  auto zeroConstOp = rewriter.create<firrtl::ConstantOp>(
+      insertLoc, signalType, rewriter.getIntegerAttr(valueType, 0));
+
+  // Walk through all blocks (pipeline stages), and insert required registers of
+  // the pipeline structure.
+  ValueVector validRegs;
+  ValueVector readyWires;
+  std::vector<llvm::SmallMapVector<Value, Value, 4>> dataRegs;
+
+  unsigned blocksIdx = 0;
+  for (auto &block : llvm::drop_begin(subModuleOp, 1)) {
+    rewriter.setInsertionPoint(block.getTerminator());
+    if (!isa<staticlogic::ReturnOp>(block.getTerminator())) {
+
+      // PART1: Insert valid registers and ready wires for each pipeline stage.
+      // Here, ready signals should not be registered otherwise the back
+      // pressure will not be correctly conducted.
+      auto validRegOp = rewriter.create<firrtl::RegInitOp>(
+          insertLoc, signalType, clockVal, resetVal, zeroConstOp,
+          rewriter.getStringAttr("valid" + std::to_string(blocksIdx)));
+      validRegs.push_back(validRegOp.getResult());
+
+      auto readyWireOp = rewriter.create<firrtl::WireOp>(
+          insertLoc, signalType,
+          rewriter.getStringAttr("ready" + std::to_string(blocksIdx)));
+      readyWires.push_back(readyWireOp.getResult());
+
+      // PART2: Identify values that are required to be registered, and insert
+      // stage registers for these data values.
+      ValueVector stageOuts;
+
+      // Walk through all block arguments. If an argument is used by other
+      // blocks, it needs to be registered.
+      for (auto arg : block.getArguments())
+        for (auto &use : arg.getUses())
+          if (use.getOwner()->getBlock() != &block) {
+            stageOuts.push_back(arg);
+            break;
+          }
+
+      // Walk through all results of all operations in the block. If a result is
+      // used by other blocks, it needs to be regitered.
+      for (auto &op : block)
+        for (auto result : op.getResults())
+          for (auto &use : result.getUses())
+            if (use.getOwner()->getBlock() != &block) {
+              // Only push back unique operands.
+              if (std::find(stageOuts.begin(), stageOuts.end(), result) ==
+                  stageOuts.end())
+                stageOuts.push_back(result);
+              break;
+            }
+
+      // Insert data registers.
+      llvm::SmallMapVector<Value, Value, 4> stageRegs;
+      unsigned outsIdx = 0;
+      for (auto value : stageOuts) {
+        auto regOp = rewriter.create<firrtl::RegOp>(
+            insertLoc, getFirrtlType(value.getType()), clockVal,
+            rewriter.getStringAttr("data" + std::to_string(blocksIdx) + "." +
+                                   std::to_string(outsIdx)));
+        value.replaceUsesWithIf(regOp, [&block](OpOperand &use) -> bool {
+          return use.getOwner()->getBlock() != &block;
+        });
+        stageRegs.insert(std::pair<Value, Value>(value, regOp.getResult()));
+        outsIdx += 1;
+      }
+      dataRegs.push_back(stageRegs);
+
+      blocksIdx += 1;
+    }
+  }
+
+  // TODO: Add flushable pipeline logic here.
+  // rewriter.create<firrtl::ConnectOp>(insertLoc, regOp, value);
+}
+
+static void convertPipelineOp(Operation *oldOp, FModuleOp topModuleOp,
                               unsigned pipelineIdx,
                               ConversionPatternRewriter &rewriter) {
   auto subModuleOp =
@@ -871,21 +938,18 @@ static void convertPipelineOp(Operation *oldOp, firrtl::FModuleOp topModuleOp,
   rewriter.setInsertionPoint(termOp);
   ValueVectorList portList = extractSubfields(subModuleOp, insertLoc, rewriter);
 
-  unsigned numIns = oldOp->getNumOperands();
-  unsigned numOuts = oldOp->getNumResults();
-  Value clockVal = portList[numIns + numOuts][0];
-  Value resetVal = portList[numIns + numOuts + 1][0];
-
   // Inline all blocks in the pipeline operation into the FIRRTL module.
   rewriter.inlineRegionBefore(oldOp->getRegion(0), subModuleOp.getBody(),
                               subModuleOp.end());
 
-  // Lower standard operations to FIRRTL, and insert pipeline registers.
-  for (auto &block : llvm::drop_begin(subModuleOp, 1)) {
-    rewriter.setInsertionPoint(block.getTerminator());
-    convertPipelineStage(&block, insertLoc, rewriter);
-    insertDataRegisters(&block, clockVal, insertLoc, rewriter);
-  }
+  // Lower standard operations to FIRRTL for each pipeline stage.
+  convertPipelineStages(subModuleOp, insertLoc, rewriter);
+
+  // Build all pipeline structures.
+  unsigned numIns = oldOp->getNumOperands();
+  unsigned numOuts = oldOp->getNumResults();
+  buildPipelineStructure(subModuleOp, portList, numIns, numOuts, insertLoc,
+                         rewriter);
 
   // Replace all uses of arguments of the entry block with the data sub-fields
   // of arguments of the FIRRTL pipeline module.
