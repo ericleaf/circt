@@ -834,9 +834,6 @@ static void convertPipelineStages(FModuleOp subModuleOp, Location insertLoc,
   }
 }
 
-static void buildPipelineWrapper() {}
-
-/// TODO: Add valid registers and implement flushable pipeline logic.
 static void buildPipelineStructure(FModuleOp subModuleOp,
                                    ValueVectorList portList, unsigned numIns,
                                    unsigned numOuts, Location insertLoc,
@@ -878,7 +875,9 @@ static void buildPipelineStructure(FModuleOp subModuleOp,
       readyWires.push_back(readyWireOp.getResult());
 
       // PART2: Identify values that are required to be registered, and insert
-      // stage registers for these data values.
+      // stage registers for these data values. We are not handling early output
+      // and late input in this version, all inputs will be propogated through
+      // each pipeline stages.
       ValueVector stageOuts;
 
       // Walk through all block arguments. If an argument is used by other
@@ -928,7 +927,7 @@ static void buildPipelineStructure(FModuleOp subModuleOp,
     }
   }
 
-  // Build flushable pipeline logic.
+  // Walk through all pipeline stages, and build flushable pipeline logic.
   auto validIn = rewriter.create<firrtl::WireOp>(
       insertLoc, signalType, rewriter.getStringAttr("valid_in"));
   auto readyIn = rewriter.create<firrtl::WireOp>(
@@ -946,9 +945,9 @@ static void buildPipelineStructure(FModuleOp subModuleOp,
     // registers are available.
     auto thenBlder = whenOp.getThenBodyBuilder();
 
-    // Connect data registers. Only when both the valid signal from the
-    // previous stage and the ready signal from the next stage are high,
-    // data registers are able to be updated.
+    // Connect data registers. Only when both the valid signal from the previous
+    // stage and the ready signal from the next stage are high, data registers
+    // are able to be updated.
     auto dataWillUpdate = thenBlder.create<firrtl::AndPrimOp>(
         insertLoc, signalType, readyNext, validPrev);
     auto dataWhenOp =
@@ -985,7 +984,47 @@ static void buildPipelineStructure(FModuleOp subModuleOp,
     elseBlder.create<firrtl::ConnectOp>(insertLoc, readyWires[i], oneConstOp);
   }
 
-  buildPipelineWrapper();
+  // Build pipeline wrapper and connect the pipeline structure to the input and
+  // output ports of the FIRRTL submodule.
+  auto readyOut = readyWires[0];
+  auto validOut = validRegs[blocksIdx - 1];
+
+  // The wrapper for inputs are similar to a Join elastic component.
+  // The output is triggered only after all inputs are valid.
+  Value *tmpValid = &portList[0][0];
+  for (unsigned i = 1; i < numIns; ++i) {
+    Value argValid = portList[i][0];
+    *tmpValid = rewriter.create<AndPrimOp>(insertLoc, argValid.getType(),
+                                           argValid, *tmpValid);
+  }
+  rewriter.create<ConnectOp>(insertLoc, validIn, *tmpValid);
+
+  // The input will be ready to accept new token when old token is sent out.
+  auto argReadyOp = rewriter.create<AndPrimOp>(insertLoc, readyOut.getType(),
+                                               readyOut, *tmpValid);
+  for (unsigned i = 0; i < numIns; ++i) {
+    Value argReady = portList[i][1];
+    rewriter.create<ConnectOp>(insertLoc, argReady, argReadyOp);
+  }
+
+  // The wrapper for outputs are similar to a LazyFork elastic component.
+  // The input will be ready to accept new token when all outputs are ready.
+  Value *tmpReady = &portList[numIns][1];
+  for (unsigned i = numIns + 1; i < numIns + numOuts; ++i) {
+    Value resultReady = portList[i][1];
+    *tmpReady = rewriter.create<AndPrimOp>(insertLoc, resultReady.getType(),
+                                           resultReady, *tmpReady);
+  }
+  rewriter.create<ConnectOp>(insertLoc, readyIn, *tmpReady);
+
+  // All outputs must be ready for the LazyFork to send the token.
+  auto resultValidOp = rewriter.create<AndPrimOp>(insertLoc, validOut.getType(),
+                                                  validOut, *tmpReady);
+  for (unsigned i = numIns; i < numIns + numOuts; ++i) {
+    ValueVector resultfield = portList[i];
+    Value resultValid = resultfield[0];
+    rewriter.create<ConnectOp>(insertLoc, resultValid, resultValidOp);
+  }
 }
 
 static void convertPipelineOp(Operation *oldOp, FModuleOp topModuleOp,
