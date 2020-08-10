@@ -701,6 +701,7 @@ static void buildConstantLogic(handshake::ConstantOp *oldOp,
       createConstantOp(constantType, constantValue, insertLoc, rewriter));
 }
 
+/// TODO: Add code for building buffer operations.
 static void buildBufferLogic(handshake::BufferOp *oldOp,
                              ValueVectorList portList, Location insertLoc,
                              ConversionPatternRewriter &rewriter) {
@@ -802,7 +803,8 @@ static void convertReturnOp(Operation *oldOp, FModuleOp topModuleOp,
   rewriter.eraseOp(oldOp);
 }
 
-/// TODO: Temporary. Need to be rewritten.
+/// TODO: Temporary. Need to be rewritten, maybe a separate type converter is a
+/// bood idea.
 static FIRRTLType getFirrtlType(Type type) {
   if (auto firrtlType = type.dyn_cast<FIRRTLType>()) {
     return firrtlType;
@@ -834,6 +836,7 @@ static void convertPipelineStages(FModuleOp subModuleOp, Location insertLoc,
   }
 }
 
+/// TODO: Think about how to handle feedback paths.
 static void buildPipelineStructure(FModuleOp subModuleOp,
                                    ValueVectorList portList, unsigned numIns,
                                    unsigned numOuts, Location insertLoc,
@@ -878,6 +881,9 @@ static void buildPipelineStructure(FModuleOp subModuleOp,
       // stage registers for these data values. We are not handling early output
       // and late input in this version, all inputs will be propogated through
       // each pipeline stages.
+      //
+      // TODO: Think about how to handle early output / late input / FIFO /
+      // Memory which may stall a pipeline stage.
       ValueVector stageOuts;
 
       // Walk through all block arguments. If an argument is used by other
@@ -928,6 +934,9 @@ static void buildPipelineStructure(FModuleOp subModuleOp,
   }
 
   // Walk through all pipeline stages, and build flushable pipeline logic.
+  //
+  // TODO: Rewrite the code structure. What's the right way to update registers
+  // in FIRRTL? Can we update them in several different place?
   auto validIn = rewriter.create<firrtl::WireOp>(
       insertLoc, signalType, rewriter.getStringAttr("valid_in"));
   auto readyIn = rewriter.create<firrtl::WireOp>(
