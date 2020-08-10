@@ -834,6 +834,8 @@ static void convertPipelineStages(FModuleOp subModuleOp, Location insertLoc,
   }
 }
 
+static void buildPipelineWrapper() {}
+
 /// TODO: Add valid registers and implement flushable pipeline logic.
 static void buildPipelineStructure(FModuleOp subModuleOp,
                                    ValueVectorList portList, unsigned numIns,
@@ -842,12 +844,14 @@ static void buildPipelineStructure(FModuleOp subModuleOp,
   Value clockVal = portList[numIns + numOuts][0];
   Value resetVal = portList[numIns + numOuts + 1][0];
 
-  // Prepare a constant zero operation for initializing valid registers.
+  // Prepare a constant zero and one operation for initializing valid registers.
   rewriter.setInsertionPoint(subModuleOp.front().getTerminator());
   auto signalType = UIntType::get(subModuleOp.getContext(), 1);
   auto valueType = rewriter.getIntegerType(1, /*isSigned=*/false);
   auto zeroConstOp = rewriter.create<firrtl::ConstantOp>(
       insertLoc, signalType, rewriter.getIntegerAttr(valueType, 0));
+  auto oneConstOp = rewriter.create<firrtl::ConstantOp>(
+      insertLoc, signalType, rewriter.getIntegerAttr(valueType, 1));
 
   // Walk through all blocks (pipeline stages), and insert required registers of
   // the pipeline structure.
@@ -879,18 +883,20 @@ static void buildPipelineStructure(FModuleOp subModuleOp,
 
       // Walk through all block arguments. If an argument is used by other
       // blocks, it needs to be registered.
-      for (auto arg : block.getArguments())
-        for (auto &use : arg.getUses())
+      for (auto arg : block.getArguments()) {
+        for (auto &use : arg.getUses()) {
           if (use.getOwner()->getBlock() != &block) {
             stageOuts.push_back(arg);
             break;
           }
+        }
+      }
 
       // Walk through all results of all operations in the block. If a result is
       // used by other blocks, it needs to be regitered.
-      for (auto &op : block)
-        for (auto result : op.getResults())
-          for (auto &use : result.getUses())
+      for (auto &op : block) {
+        for (auto result : op.getResults()) {
+          for (auto &use : result.getUses()) {
             if (use.getOwner()->getBlock() != &block) {
               // Only push back unique operands.
               if (std::find(stageOuts.begin(), stageOuts.end(), result) ==
@@ -898,6 +904,9 @@ static void buildPipelineStructure(FModuleOp subModuleOp,
                 stageOuts.push_back(result);
               break;
             }
+          }
+        }
+      }
 
       // Insert data registers.
       llvm::SmallMapVector<Value, Value, 4> stageRegs;
@@ -919,8 +928,64 @@ static void buildPipelineStructure(FModuleOp subModuleOp,
     }
   }
 
-  // TODO: Add flushable pipeline logic here.
-  // rewriter.create<firrtl::ConnectOp>(insertLoc, regOp, value);
+  // Build flushable pipeline logic.
+  auto validIn = rewriter.create<firrtl::WireOp>(
+      insertLoc, signalType, rewriter.getStringAttr("valid_in"));
+  auto readyIn = rewriter.create<firrtl::WireOp>(
+      insertLoc, signalType, rewriter.getStringAttr("ready_in"));
+
+  for (unsigned i = 0; i < blocksIdx; ++i) {
+    auto validPrev = i == 0 ? validIn : validRegs[i - 1];
+    auto readyNext = i == blocksIdx - 1 ? readyIn : readyWires[i + 1];
+
+    rewriter.setInsertionPoint(subModuleOp.back().getTerminator());
+    auto whenOp = rewriter.create<firrtl::WhenOp>(insertLoc, validRegs[i],
+                                                  /*withElseRegion=*/true);
+
+    // PART1: When valid register is set high, indicating the corresponding data
+    // registers are available.
+    auto thenBlder = whenOp.getThenBodyBuilder();
+
+    // Connect data registers. Only when both the valid signal from the
+    // previous stage and the ready signal from the next stage are high,
+    // data registers are able to be updated.
+    auto dataWillUpdate = thenBlder.create<firrtl::AndPrimOp>(
+        insertLoc, signalType, readyNext, validPrev);
+    auto dataWhenOp =
+        thenBlder.create<firrtl::WhenOp>(insertLoc, dataWillUpdate, false);
+    auto dataBlder = dataWhenOp.getThenBodyBuilder();
+    for (auto &pair : dataRegs[i])
+      dataBlder.create<firrtl::ConnectOp>(insertLoc, pair.second, pair.first);
+
+    // Connect valid register. Only when the valid signal from the previous
+    // stage is low, and the ready signal from the next stage is high, valid
+    // register will be updated to low.
+    auto validWillUpdate = thenBlder.create<firrtl::AndPrimOp>(
+        insertLoc, signalType, readyNext,
+        thenBlder.create<firrtl::NotPrimOp>(insertLoc, signalType, validPrev));
+    auto validWhenOp =
+        thenBlder.create<firrtl::WhenOp>(insertLoc, validWillUpdate, false);
+    auto validBlder = validWhenOp.getThenBodyBuilder();
+    validBlder.create<firrtl::ConnectOp>(insertLoc, validRegs[i], zeroConstOp);
+
+    // Connect ready wire.
+    thenBlder.create<firrtl::ConnectOp>(insertLoc, readyWires[i], readyNext);
+
+    // PART2: When valid register is set low, indicating the corresponding data
+    // registers are unavailable. This case is relatively easy to understand,
+    // since registers are occupied by bubbles, they are able to be updated.
+    auto elseBlder = whenOp.getElseBodyBuilder();
+
+    // Connect data registers.
+    for (auto &pair : dataRegs[i])
+      elseBlder.create<firrtl::ConnectOp>(insertLoc, pair.second, pair.first);
+
+    // Connect valid and ready.
+    elseBlder.create<firrtl::ConnectOp>(insertLoc, validRegs[i], validPrev);
+    elseBlder.create<firrtl::ConnectOp>(insertLoc, readyWires[i], oneConstOp);
+  }
+
+  buildPipelineWrapper();
 }
 
 static void convertPipelineOp(Operation *oldOp, FModuleOp topModuleOp,
@@ -932,10 +997,8 @@ static void convertPipelineOp(Operation *oldOp, FModuleOp topModuleOp,
                           return op->getName().getStringRef().str() + "_" +
                                  std::to_string(pipelineIdx);
                         });
-
-  Operation *termOp = subModuleOp.getBody().front().getTerminator();
-  Location insertLoc = termOp->getLoc();
-  rewriter.setInsertionPoint(termOp);
+  Location insertLoc = subModuleOp.getLoc();
+  rewriter.setInsertionPoint(subModuleOp.front().getTerminator());
   ValueVectorList portList = extractSubfields(subModuleOp, insertLoc, rewriter);
 
   // Inline all blocks in the pipeline operation into the FIRRTL module.
@@ -960,6 +1023,7 @@ static void convertPipelineOp(Operation *oldOp, FModuleOp topModuleOp,
   }
 
   // Convert return operation.
+  rewriter.setInsertionPoint(subModuleOp.back().getTerminator());
   unsigned outsIdx = 0;
   for (auto result : subModuleOp.back().getTerminator()->getOperands()) {
     rewriter.create<ConnectOp>(insertLoc, portList[numIns + outsIdx][2],
@@ -968,7 +1032,7 @@ static void convertPipelineOp(Operation *oldOp, FModuleOp topModuleOp,
   }
 
   // Cleanup the block structure of the pipeline FIRRTL sub-module.
-  auto &entryBlock = subModuleOp.getBody().front().getOperations();
+  auto &entryBlock = subModuleOp.front().getOperations();
   for (auto &block :
        llvm::make_early_inc_range(llvm::drop_begin(subModuleOp, 1))) {
     rewriter.eraseOp(block.getTerminator());
