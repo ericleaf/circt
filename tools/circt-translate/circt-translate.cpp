@@ -9,6 +9,7 @@
 #include "circt/Dialect/FIRRTL/Dialect.h"
 #include "circt/Dialect/LLHD/IR/LLHDDialect.h"
 #include "circt/Dialect/RTL/Dialect.h"
+#include "circt/Dialect/SV/Dialect.h"
 #include "circt/EmitVerilog.h"
 #include "circt/FIRParser.h"
 #include "circt/Target/Verilog/TranslateToVerilog.h"
@@ -47,13 +48,16 @@ static llvm::cl::opt<bool> verifyDiagnostics(
     llvm::cl::init(false));
 
 int main(int argc, char **argv) {
+  enableGlobalDialectRegistry(true);
+
   // Register MLIR stuff.
   registerAsmPrinterCLOptions();
   registerMLIRContextCLOptions();
   registerDialect<StandardOpsDialect>();
 
-  // RTL.
+  // RTL and SV.
   registerDialect<rtl::RTLDialect>();
+  registerDialect<sv::SVDialect>();
 
   // Register FIRRTL stuff.
   registerDialect<firrtl::FIRRTLDialect>();

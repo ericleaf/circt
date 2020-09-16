@@ -8,11 +8,14 @@
 #include "circt/Dialect/FIRRTL/Visitors.h"
 #include "circt/Dialect/RTL/Ops.h"
 #include "circt/Dialect/RTL/Visitors.h"
+#include "circt/Dialect/SV/Ops.h"
+#include "circt/Dialect/SV/Visitors.h"
 #include "circt/Support/LLVM.h"
 #include "mlir/IR/Module.h"
 #include "mlir/IR/StandardTypes.h"
 #include "mlir/Translation.h"
 #include "llvm/ADT/StringSet.h"
+#include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/raw_ostream.h"
 
 using namespace circt;
@@ -37,40 +40,31 @@ static llvm::ManagedStatic<StringSet<>> reservedWordCache;
 static bool isVerilogExpression(Operation *op) {
   // All FIRRTL expressions and RTL combinatorial logic ops are Verilog
   // expressions.
-  return isExpression(op) || rtl::isCombinatorial(op);
+  return isExpression(op) || rtl::isCombinatorial(op) ||
+         isa<sv::TextualValueOp>(op);
 }
 
 /// Return the width of the specified FIRRTL type in bits or -1 if it isn't
 /// supported.
 static int getBitWidthOrSentinel(Type type) {
-  switch (type.getKind()) {
-  case StandardTypes::Integer:
-    return type.cast<IntegerType>().getWidth();
-
-  case FIRRTLType::Clock:
-  case FIRRTLType::Reset:
-  case FIRRTLType::AsyncReset:
-    return 1;
-
-  case FIRRTLType::SInt:
-  case FIRRTLType::UInt: {
-    // Turn zero-bit values into single bit ones for simplicity.  This occurs
-    // in the addr lines of mems with depth=1.
-    auto result = type.cast<IntType>().getWidthOrSentinel();
-    return result ? result : 1;
-  }
-
-  case FIRRTLType::Analog: {
-    auto result = type.cast<AnalogType>().getWidthOrSentinel();
-    return result ? result : 1;
-  }
-
-  case FIRRTLType::Flip:
-    return getBitWidthOrSentinel(type.cast<FlipType>().getElementType());
-
-  default:
-    return -1;
-  };
+  return TypeSwitch<Type, int>(type)
+      .Case<IntegerType>(
+          [](IntegerType integerType) { return integerType.getWidth(); })
+      .Case<ClockType, ResetType, AsyncResetType>([](Type) { return 1; })
+      .Case<SIntType, UIntType>([](IntType intType) {
+        // Turn zero-bit values into single bit ones for simplicity.  This
+        // occurs in the addr lines of mems with depth=1.
+        auto result = intType.getWidthOrSentinel();
+        return result ? result : 1;
+      })
+      .Case<AnalogType>([](AnalogType analogType) {
+        auto result = analogType.getWidthOrSentinel();
+        return result ? result : 1;
+      })
+      .Case<FlipType>([](FlipType flipType) {
+        return getBitWidthOrSentinel(flipType.getElementType());
+      })
+      .Default([](Type) { return -1; });
 }
 
 /// Return the type of the specified value, converted to a passive type.  If "T"
@@ -287,6 +281,7 @@ public:
       : VerilogEmitterBase(state) {}
 
   void emitFModule(FModuleOp module);
+  void emitRTLModule(rtl::RTLModuleOp module);
   void emitExpression(Value exp, SmallPtrSet<Operation *, 8> &emittedExprs,
                       bool forceRootExpr = false);
 
@@ -300,8 +295,15 @@ public:
   void emitStatement(AttachOp op);
   void emitStatement(ConnectOp op);
   void emitStatement(rtl::ConnectOp op);
+  void emitStatement(rtl::RTLInstanceOp op);
   void emitStatement(PrintFOp op);
   void emitStatement(StopOp op);
+  void emitStatement(sv::IfDefOp op);
+  void emitStatement(sv::IfOp op);
+  void emitStatement(sv::AlwaysAtPosEdgeOp op);
+  void emitStatement(sv::FWriteOp op);
+  void emitStatement(sv::FatalOp op);
+  void emitStatement(sv::FinishOp op);
   void emitDecl(NodeOp op);
   void emitDecl(InstanceOp op);
   void emitDecl(RegOp op);
@@ -645,22 +647,21 @@ struct SubExprInfo {
 
 /// Return the verilog signedness of the specified type.
 static SubExprSignedness getSignednessOf(Type type) {
-  switch (type.getKind()) {
-  default:
-    assert(0 && "unsupported type");
-  case StandardTypes::Integer:
-    return type.cast<IntegerType>().isSigned() ? IsSigned : IsUnsigned;
-  case FIRRTLType::Flip:
-    return getSignednessOf(type.cast<FlipType>().getElementType());
-  case FIRRTLType::Clock:
-  case FIRRTLType::Reset:
-  case FIRRTLType::AsyncReset:
-    return IsUnsigned;
-  case FIRRTLType::SInt:
-    return IsSigned;
-  case FIRRTLType::UInt:
-    return IsUnsigned;
-  }
+  return TypeSwitch<Type, SubExprSignedness>(type)
+      .Case<IntegerType>([](IntegerType integerType) {
+        return integerType.isSigned() ? IsSigned : IsUnsigned;
+      })
+      .Case<FlipType>([](FlipType flipType) {
+        return getSignednessOf(flipType.getElementType());
+      })
+      .Case<ClockType, ResetType, AsyncResetType>(
+          [](Type) { return IsUnsigned; })
+      .Case<SIntType>([](Type) { return IsSigned; })
+      .Case<UIntType>([](Type) { return IsUnsigned; })
+      .Default([](Type) {
+        assert(0 && "unsupported type");
+        return IsUnsigned;
+      });
 }
 
 namespace {
@@ -671,7 +672,8 @@ namespace {
 /// stuff, then pre-insert parentheses and other things if we find out that it
 /// was needed later.
 class ExprEmitter : public ExprVisitor<ExprEmitter, SubExprInfo>,
-                    public rtl::CombinatorialVisitor<ExprEmitter, SubExprInfo> {
+                    public rtl::CombinatorialVisitor<ExprEmitter, SubExprInfo>,
+                    public sv::Visitor<ExprEmitter, SubExprInfo> {
 public:
   /// Create an ExprEmitter for the specified module emitter, and keeping track
   /// of any emitted expressions in the specified set.
@@ -684,6 +686,7 @@ public:
   std::string emitExpressionToString(Value exp, VerilogPrecedence precedence);
   friend class ExprVisitor;
   friend class CombinatorialVisitor;
+  friend class Visitor;
 
   /// Do a best-effort job of looking through noop cast operations.
   Value lookThroughNoopCasts(Value value) {
@@ -704,12 +707,14 @@ private:
   SubExprInfo visitInvalidExpr(Operation *op) {
     return dispatchCombinatorialVisitor(op);
   }
-  SubExprInfo visitInvalidComb(Operation *op) { return visitUnhandledExpr(op); }
+  SubExprInfo visitInvalidComb(Operation *op) { return dispatchSVVisitor(op); }
   SubExprInfo visitUnhandledComb(Operation *op) {
     return visitUnhandledExpr(op);
   }
+  SubExprInfo visitUnhandledSV(Operation *op) { return visitUnhandledExpr(op); }
 
   using ExprVisitor::visitExpr;
+  using Visitor::visitSV;
   SubExprInfo visitExpr(firrtl::ConstantOp op);
 
   /// Emit a verilog concatenation of the specified values.  If the before or
@@ -742,6 +747,8 @@ private:
   SubExprInfo emitNoopCast(Operation *op) {
     return emitSubExpr(op->getOperand(0), LowestPrecedence);
   }
+
+  SubExprInfo visitSV(sv::TextualValueOp op);
 
   SubExprInfo visitExpr(AddPrimOp op) {
     return emitVariadic(op, Addition, "+");
@@ -1088,6 +1095,11 @@ SubExprInfo ExprEmitter::emitBitSelect(Value operand, unsigned hiBit,
   return {Unary, IsUnsigned};
 }
 
+SubExprInfo ExprEmitter::visitSV(sv::TextualValueOp op) {
+  os << op.string();
+  return {Unary, IsUnsigned};
+}
+
 SubExprInfo ExprEmitter::visitExpr(firrtl::ConstantOp op) {
   auto resType = op.getType().cast<IntType>();
   if (resType.getWidthOrSentinel() == -1)
@@ -1395,6 +1407,108 @@ void ModuleEmitter::emitStatement(StopOp op) {
   addAtPosEdge(action, locInfo, clockExpr, "!SYNTHESIS", condExpr);
 }
 
+void ModuleEmitter::emitStatement(sv::FWriteOp op) {
+  SmallPtrSet<Operation *, 8> ops;
+  ops.insert(op);
+
+  indent() << "$fwrite(32'h80000002, \"";
+  os.write_escaped(op.string());
+  os << '"';
+
+  for (auto operand : op.operands()) {
+    os << ", " << emitExpressionToString(operand, ops);
+  }
+  os << ");";
+  emitLocationInfoAndNewLine(ops);
+}
+
+void ModuleEmitter::emitStatement(sv::FatalOp op) {
+  SmallPtrSet<Operation *, 8> ops;
+  ops.insert(op);
+  indent() << "$fatal;";
+  emitLocationInfoAndNewLine(ops);
+}
+
+void ModuleEmitter::emitStatement(sv::FinishOp op) {
+  SmallPtrSet<Operation *, 8> ops;
+  ops.insert(op);
+  indent() << "$finish;";
+  emitLocationInfoAndNewLine(ops);
+}
+
+void ModuleEmitter::emitStatement(sv::IfDefOp op) {
+  auto cond = op.cond();
+
+  if (cond.startswith("!"))
+    indent() << "#ifndef " << cond.drop_front(1);
+  else
+    indent() << "#ifdef " << cond;
+
+  SmallPtrSet<Operation *, 8> ops;
+  ops.insert(op);
+  emitLocationInfoAndNewLine(ops);
+
+  addIndent();
+  for (auto &op : op.getBodyBlock()->without_terminator())
+    emitOperation(&op);
+  reduceIndent();
+
+  indent() << "#endif\n";
+}
+
+/// Emit the body of a control flow statement that is surrounded by begin/end
+/// markers if non-singular.  If the control flow construct is multi-line and
+/// if multiLineComment is non-null, the string is included in a comment after
+/// the 'end' to make it easier to associate.
+static void emitBeginEndRegion(Block *block,
+                               SmallPtrSet<Operation *, 8> &locationOps,
+                               ModuleEmitter &emitter,
+                               const char *multiLineComment = nullptr) {
+  auto isSingleVerilogStatement = [&](Operation &op) {
+    // Not all expressions and statements are guaranteed to emit a single
+    // Verilog statement (for the purposes of if statements).  Just do a simple
+    // check here for now.  This can be improved over time.
+    return isa<sv::FWriteOp>(op) || isa<sv::FinishOp>(op) ||
+           isa<sv::FatalOp>(op);
+  };
+
+  // Determine if we can omit the begin/end keywords.
+  bool hasOneStmt = llvm::hasSingleElement(block->without_terminator()) &&
+                    isSingleVerilogStatement(block->front());
+  if (!hasOneStmt)
+    emitter.os << " begin";
+  emitter.emitLocationInfoAndNewLine(locationOps);
+
+  emitter.addIndent();
+  for (auto &op : block->without_terminator())
+    emitter.emitOperation(&op);
+  emitter.reduceIndent();
+
+  if (!hasOneStmt) {
+    emitter.indent() << "end";
+    if (multiLineComment)
+      emitter.os << " // " << multiLineComment;
+    emitter.os << '\n';
+  }
+}
+
+void ModuleEmitter::emitStatement(sv::IfOp op) {
+  SmallPtrSet<Operation *, 8> ops;
+  ops.insert(op);
+
+  indent() << "if (" << emitExpressionToString(op.cond(), ops) << ')';
+  emitBeginEndRegion(op.getBodyBlock(), ops, *this);
+}
+
+void ModuleEmitter::emitStatement(sv::AlwaysAtPosEdgeOp op) {
+  SmallPtrSet<Operation *, 8> ops;
+  ops.insert(op);
+
+  indent() << "always @(posedge " << emitExpressionToString(op.clock(), ops)
+           << ")";
+  emitBeginEndRegion(op.getBodyBlock(), ops, *this, "always @(posedge)");
+}
+
 void ModuleEmitter::emitDecl(NodeOp op) {
   SmallPtrSet<Operation *, 8> ops;
   ops.insert(op);
@@ -1474,6 +1588,37 @@ void ModuleEmitter::emitDecl(InstanceOp op) {
              << instanceName << elt.suffix << (isLast ? ")\n" : "),\n");
   }
   indent() << ");\n";
+}
+
+void ModuleEmitter::emitStatement(rtl::RTLInstanceOp op) {
+  SmallPtrSet<Operation *, 8> ops;
+  ops.insert(op);
+
+  auto instanceName = op.instanceName();
+  StringRef defName = op.moduleName();
+
+  auto opArgs = op.inputs();
+
+  auto moduleIR = op.getParentOfType<firrtl::CircuitOp>();
+  auto referencedModule =
+      cast<rtl::RTLModuleOp>(moduleIR.lookupSymbol(defName));
+
+  if (!referencedModule)
+    emitOpError(op, "could not find mlir node named @" + defName);
+
+  os << ' ' << defName << ' ' << instanceName << " (";
+  emitLocationInfoAndNewLine(ops);
+
+  SmallVector<rtl::RTLModulePortInfo, 8> portInfo;
+  referencedModule.getRTLPortInfo(portInfo);
+
+  for (int i = 0; i < portInfo.size(); ++i) {
+    rtl::RTLModulePortInfo &elt = portInfo[i];
+    bool isLast = &elt == &portInfo.back();
+    indent() << "  ." << StringRef(elt.name.getValue()) << " ("
+             << getName(opArgs[i]) << (isLast ? ")\n" : "),\n");
+  }
+  indent() << ")\n";
 }
 
 void ModuleEmitter::emitDecl(RegOp op) {
@@ -1675,7 +1820,8 @@ static bool isExpressionUnableToInline(Operation *op) {
     // "a vector, packed array, packed structure, parameter or concatenation".
     // It cannot be an arbitrary expression.
     if (isa<HeadPrimOp>(user) || isa<TailPrimOp>(user) ||
-        isa<ShrPrimOp>(user) || isa<BitsPrimOp>(user))
+        isa<ShrPrimOp>(user) || isa<BitsPrimOp>(user) ||
+        isa<rtl::ExtractOp>(user))
       if (!isOkToBitSelectFrom(op))
         return true;
 
@@ -1740,8 +1886,7 @@ void ModuleEmitter::collectNamesEmitDecls(Block &block) {
   SmallVector<Operation *, 16> declsToEmit;
 
   for (auto &op : block) {
-    // If the op has no results, then it doesn't produce a name.
-    if (op.getNumResults() == 0)
+    if (op.getNumResults() == 0 || isa<rtl::RTLInstanceOp>(op))
       continue;
 
     assert(op.getNumResults() == 1 && "firrtl only has single-op results");
@@ -1908,6 +2053,9 @@ void ModuleEmitter::emitOperation(Operation *op) {
     bool visitStmt(rtl::ConnectOp op) {
       return emitter.emitStatement(op), true;
     }
+    bool visitStmt(rtl::RTLInstanceOp op) {
+      return emitter.emitStatement(op), true;
+    }
     bool visitStmt(rtl::WireOp op) { return true; }
 
     bool visitUnhandledStmt(Operation *op) { return false; }
@@ -1918,6 +2066,30 @@ void ModuleEmitter::emitOperation(Operation *op) {
   };
 
   if (RTLStmtEmitter(*this).dispatchStmtVisitor(op))
+    return;
+
+  class SVEmitter : public sv::Visitor<SVEmitter, bool> {
+  public:
+    SVEmitter(ModuleEmitter &emitter) : emitter(emitter) {}
+
+    using Visitor::visitSV;
+    bool visitSV(sv::IfDefOp op) { return emitter.emitStatement(op), true; }
+    bool visitSV(sv::IfOp op) { return emitter.emitStatement(op), true; }
+    bool visitSV(sv::AlwaysAtPosEdgeOp op) {
+      return emitter.emitStatement(op), true;
+    }
+    bool visitSV(sv::FWriteOp op) { return emitter.emitStatement(op), true; }
+    bool visitSV(sv::FatalOp op) { return emitter.emitStatement(op), true; }
+    bool visitSV(sv::FinishOp op) { return emitter.emitStatement(op), true; }
+
+    bool visitUnhandledSV(Operation *op) { return false; }
+    bool visitInvalidSV(Operation *op) { return false; }
+
+  private:
+    ModuleEmitter &emitter;
+  };
+
+  if (SVEmitter(*this).dispatchSVVisitor(op))
     return;
 
   emitOpError(op, "cannot emit this operation to Verilog");
@@ -2186,6 +2358,112 @@ void ModuleEmitter::emitFModule(FModuleOp module) {
   os << "endmodule\n\n";
 }
 
+void ModuleEmitter::emitRTLModule(rtl::RTLModuleOp module) {
+  // Add all the ports to the name table.
+  SmallVector<rtl::RTLModulePortInfo, 8> portInfo;
+  module.getRTLPortInfo(portInfo);
+
+  size_t nextPort = 0;
+  for (auto &port : portInfo)
+    addName(module.getArgument(nextPort++), port.name);
+
+  os << "module " << module.getName() << '(';
+  if (!portInfo.empty())
+    os << '\n';
+
+  auto isOutput = [](StringAttr direction) -> bool {
+    return direction.getValue().str() == "out";
+  };
+
+  // Determine the width of the widest type we have to print so everything
+  // lines up nicely.
+  bool hasOutputs = false;
+  unsigned maxTypeWidth = 0;
+  for (auto &port : portInfo) {
+    auto portType = port.type;
+    hasOutputs |= isOutput(port.direction);
+
+    int bitWidth = getBitWidthOrSentinel(portType);
+    if (bitWidth == -1 || bitWidth == 1)
+      continue; // The error case is handled below.
+
+    // Add 4 to count the width of the "[:0] ".
+    unsigned thisWidth = getPrintedIntWidth(bitWidth - 1) + 5;
+    maxTypeWidth = std::max(thisWidth, maxTypeWidth);
+  }
+
+  addIndent();
+
+  for (size_t portIdx = 0, e = portInfo.size(); portIdx != e;) {
+    size_t startOfLinePos = os.tell();
+
+    indent();
+    // Emit the arguments.
+    auto portType = portInfo[portIdx].type;
+    bool isThisPortOutput = isOutput(portInfo[portIdx].direction);
+    if (isThisPortOutput)
+      os << "output ";
+    else
+      os << (hasOutputs ? "input  " : "input ");
+
+    int bitWidth = getBitWidthOrSentinel(portType);
+    emitTypePaddedToWidth(portType, maxTypeWidth, module);
+
+    // Emit the name.
+    os << getName(module.getArgument(portIdx));
+    ++portIdx;
+
+    // If we have any more ports with the same types and the same direction,
+    // emit them in a list on the same line.
+    while (portIdx != e &&
+           isOutput(portInfo[portIdx].direction) == isThisPortOutput &&
+           bitWidth == getBitWidthOrSentinel(portInfo[portIdx].type)) {
+      // Don't exceed our preferred line length.
+      StringRef name = getName(module.getArgument(portIdx));
+      if (os.tell() + 2 + name.size() - startOfLinePos >
+          // We use "-2" here because we need a trailing comma or ); for the
+          // decl.
+          preferredSourceWidth - 2)
+        break;
+
+      // Append this to the running port decl.
+      os << ", " << name;
+      ++portIdx;
+    }
+
+    if (portIdx != e)
+      os << ',';
+    else
+      os << ");\n";
+    os << '\n';
+  }
+
+  if (portInfo.empty())
+    os << ");\n";
+
+  // Build up the symbol table for all of the values that need names in the
+  // module.
+  collectNamesEmitDecls(*module.getBodyBlock());
+
+  // Emit the body.
+  for (auto &op : *module.getBodyBlock()) {
+    emitOperation(&op);
+  }
+
+  // Emit the conditional statements at the bottom.  Start by sorting the list
+  // to group by kind.
+  std::stable_sort(conditionalStmts.begin(), conditionalStmts.end());
+
+  // Emit conditional statements by groups.
+  splitByPredicate(
+      *this, conditionalStmts, emitConditionStmtKind,
+      [](const ModuleEmitter::ConditionalStatement &condStmt)
+          -> ModuleEmitter::ConditionalStmtKind { return condStmt.kind; });
+  reduceIndent();
+
+  os << "endmodule\n\n";
+}
+
 //===----------------------------------------------------------------------===//
 // CircuitEmitter
 //===----------------------------------------------------------------------===//
@@ -2266,11 +2544,15 @@ void CircuitEmitter::emitCircuit(CircuitOp circuit) {
     if (auto module = dyn_cast<FModuleOp>(op)) {
       ModuleEmitter(state).emitFModule(module);
       continue;
+    } else if (auto module = dyn_cast<rtl::RTLModuleOp>(op)) {
+      ModuleEmitter(state).emitRTLModule(module);
+      continue;
     }
 
     // Ignore the done terminator at the end of the circuit.
     // Ignore 'ext modules'.
-    if (isa<DoneOp>(op) || isa<FExtModuleOp>(op))
+    if (isa<rtl::DoneOp>(op) || isa<firrtl::DoneOp>(op) ||
+        isa<FExtModuleOp>(op))
       continue;
 
     op.emitError("unknown operation");
